@@ -4,13 +4,16 @@ Binds a cryptographically secure random secret to biometric binary template B.
 Helper Data W = B XOR Codeword(C)
 Commitment H = SHA256(C)
 Recovery: C' = B' XOR W = Codeword(C) XOR (B XOR B')
-ECC Decoder recovers C if Hamming_Distance(B, B') <= ECC_Capacity.
+ECC Decoder recovers C if Hamming_Distance(B, B') is within tiled majority-vote capacity.
 """
 
 import hashlib
 import numpy as np
-from .key_generation import generate_secret_key
+
+from features.template import BITS_PER_SECTOR, N_SECTORS, iter_binary_alignments
 from .error_correction import BlockECC
+from .key_generation import generate_secret_key
+
 
 class FuzzyCommitment:
     def __init__(self, secret_bits=64, vector_bits=256, max_global_error_rate=0.22):
@@ -21,39 +24,17 @@ class FuzzyCommitment:
 
     @staticmethod
     def hash_secret(secret_vector):
-        """
-        Computes SHA-256 hash of secret binary vector.
-        """
         secret_bytes = np.packbits(secret_vector).tobytes()
         return hashlib.sha256(secret_bytes).hexdigest()
 
     def enroll(self, biometric_vector):
-        """
-        Enrolls a biometric vector into the Fuzzy Commitment scheme.
-        
-        Args:
-            biometric_vector (np.ndarray): Binary biometric representation B of length `vector_bits`.
-            
-        Returns:
-            dict containing:
-                - helper_data (np.ndarray): Protected helper data W = B XOR C_enc
-                - commitment (str): Cryptographic hash H = SHA256(C)
-                - secret (np.ndarray): Retained during enrollment phase for local verification testing
-        """
         biometric_vector = np.array(biometric_vector, dtype=np.uint8)
         if len(biometric_vector) != self.vector_bits:
             raise ValueError(f"Expected biometric vector length {self.vector_bits}, got {len(biometric_vector)}")
 
-        # Step 1: Generate random cryptographic secret C
         _, secret = generate_secret_key(bit_length=self.secret_bits)
-
-        # Step 2: Encode secret C using ECC to get codeword C_enc
         codeword = self.ecc.encode(secret)
-
-        # Step 3: Compute protected helper data W = B XOR C_enc
         helper_data = np.bitwise_xor(biometric_vector, codeword)
-
-        # Step 4: Compute cryptographic commitment H = SHA256(C)
         commitment = self.hash_secret(secret)
 
         # Step 5: Compute Public Key PK = g^S mod p (Schnorr group generator)
@@ -79,6 +60,7 @@ class FuzzyCommitment:
     def recover_secret(self, query_biometric_vector, helper_data, stored_commitment, max_global_error_rate=Ellipsis):
         """
         Attempts to recover secret key C using query biometric vector B' and stored helper data W.
+        Tries cyclic FingerCode sector rotations so a residual in-plane rotation does not break a genuine match.
         Enforces privacy-preserving global error threshold check without storing raw templates.
         
         Returns:
@@ -89,6 +71,8 @@ class FuzzyCommitment:
                 - error_rate (float): Global bit difference ratio d_H(B', B) / vector_bits
                 - hash_matched (bool)
                 - within_global_limit (bool)
+                - candidate_hash (str)
+                - residual_errors (int)
         """
         if max_global_error_rate is Ellipsis:
             max_global_error_rate = self.max_global_error_rate
@@ -96,29 +80,56 @@ class FuzzyCommitment:
         query_biometric_vector = np.array(query_biometric_vector, dtype=np.uint8)
         helper_data = np.array(helper_data, dtype=np.uint8)
 
-        # Step 1: Compute noisy codeword C' = B' XOR W
-        noisy_codeword = np.bitwise_xor(query_biometric_vector, helper_data)
+        best_hash_matched = None
+        best_any = None
 
-        # Step 2: Apply ECC decoder to recover candidate secret
-        recovered_secret, corrected_errors, _ = self.ecc.decode(noisy_codeword)
+        alignments = list(iter_binary_alignments(query_biometric_vector, N_SECTORS, BITS_PER_SECTOR)) if len(query_biometric_vector) == 256 else [query_biometric_vector]
 
-        # Step 3: Verify candidate secret against stored cryptographic commitment hash
-        candidate_hash = self.hash_secret(recovered_secret)
-        hash_matched = (candidate_hash == stored_commitment)
+        for aligned in alignments:
+            noisy_codeword = np.bitwise_xor(aligned, helper_data)
+            recovered_secret, corrected_errors, _ = self.ecc.decode(noisy_codeword)
+            candidate_hash = self.hash_secret(recovered_secret)
+            hash_matched = (candidate_hash == stored_commitment)
 
-        # Step 4: Privacy-Preserving Global Error Rate Gate
-        # Compute global bit error rate: corrected_errors == d_H(B_query, B_enroll)
-        error_rate = corrected_errors / float(self.vector_bits)
-        within_global_limit = (max_global_error_rate is None) or (error_rate <= max_global_error_rate)
+            reconstructed = self.ecc.encode(recovered_secret)
+            residual = int(np.sum(noisy_codeword != reconstructed))
 
-        is_valid = hash_matched and within_global_limit
+            error_rate = corrected_errors / float(self.vector_bits)
+            within_global_limit = (max_global_error_rate is None) or (error_rate <= max_global_error_rate)
+            is_valid = hash_matched and within_global_limit
 
-        return {
-            "success": is_valid,
-            "recovered_secret": recovered_secret if is_valid else None,
-            "errors_corrected": corrected_errors,
-            "error_rate": error_rate,
-            "hash_matched": hash_matched,
-            "within_global_limit": within_global_limit,
-            "candidate_hash": candidate_hash
+            res = {
+                "success": is_valid,
+                "recovered_secret": recovered_secret if is_valid else None,
+                "errors_corrected": corrected_errors,
+                "error_rate": error_rate,
+                "hash_matched": hash_matched,
+                "within_global_limit": within_global_limit,
+                "candidate_hash": candidate_hash,
+                "residual_errors": residual,
+            }
+
+            if is_valid:
+                return res
+
+            if hash_matched:
+                if best_hash_matched is None or residual < best_hash_matched["residual_errors"]:
+                    best_hash_matched = res
+            elif best_any is None or residual < best_any["residual_errors"]:
+                best_any = res
+
+        if best_hash_matched is not None:
+            return best_hash_matched
+
+        return best_any if best_any is not None else {
+            "success": False,
+            "recovered_secret": None,
+            "errors_corrected": 0,
+            "error_rate": 1.0,
+            "hash_matched": False,
+            "within_global_limit": False,
+            "candidate_hash": "",
+            "residual_errors": self.vector_bits,
         }
+
+
